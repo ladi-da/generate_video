@@ -178,20 +178,27 @@ class GenerateVideoClient:
                 return False
             
             output = result.get('output', {})
+            video_url = output.get('video_url')
             video_b64 = output.get('video')
             
-            if not video_b64:
+            if not video_url and not video_b64:
                 logger.error("Video data not found")
                 return False
             
             # Create directory
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             
-            # Decode base64 and save video
-            decoded_video = base64.b64decode(video_b64)
-            
-            with open(output_path, 'wb') as f:
-                f.write(decoded_video)
+            if video_url:
+                response = requests.get(video_url, timeout=120, stream=True)
+                response.raise_for_status()
+                with open(output_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            else:
+                decoded_video = base64.b64decode(video_b64)
+                with open(output_path, 'wb') as f:
+                    f.write(decoded_video)
             
             file_size = os.path.getsize(output_path)
             logger.info(f"✅ Video saved successfully: {output_path} ({file_size / (1024*1024):.1f}MB)")
@@ -208,11 +215,11 @@ class GenerateVideoClient:
         negative_prompt: Optional[str] = None,
         width: int = 480,
         height: int = 832,
-        length: int = 81,
-        steps: int = 10,
+        length: int = 17,
+        steps: int = 8,
         seed: int = 42,
         cfg: float = 2.0,
-        context_overlap: int = 48,
+        context_overlap: int = 16,
         lora_pairs: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
@@ -288,11 +295,11 @@ class GenerateVideoClient:
         negative_prompt: Optional[str] = None,
         width: int = 480,
         height: int = 832,
-        length: int = 81,
-        steps: int = 10,
+        length: int = 17,
+        steps: int = 8,
         seed: int = 42,
         cfg: float = 2.0,
-        context_overlap: int = 48,
+        context_overlap: int = 16,
         lora_pairs: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
@@ -424,8 +431,8 @@ def main():
         negative_prompt="blurry, low quality, distorted",
         width=480,
         height=832,
-        length=81,
-        steps=10,
+        length=17,
+        steps=8,
         seed=42,
         cfg=2.0
     )
@@ -454,8 +461,8 @@ def main():
         negative_prompt="blurry, low quality, distorted",
         width=480,
         height=832,
-        length=81,
-        steps=10,
+        length=17,
+        steps=8,
         seed=42,
         cfg=2.0,
         lora_pairs=lora_pairs

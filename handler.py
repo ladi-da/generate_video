@@ -11,6 +11,9 @@ import urllib.parse
 import binascii # Base64 에러 처리를 위해 import
 import subprocess
 import time
+import copy
+from functools import lru_cache
+
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,6 +21,27 @@ logger = logging.getLogger(__name__)
 
 server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
 client_id = str(uuid.uuid4())
+
+DEFAULT_NEGATIVE_PROMPT = "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+DEFAULT_LENGTH = 17
+DEFAULT_STEPS = 8
+DEFAULT_CFG = 2.0
+DEFAULT_CONTEXT_OVERLAP = 16
+MAX_LORA_PAIRS = 4
+
+
+def clamp_int(value, minimum, maximum=None):
+    try:
+        numeric_value = int(value)
+    except Exception:
+        raise Exception(f"정수 값이 아닙니다: {value}")
+
+    if maximum is not None:
+        numeric_value = min(numeric_value, maximum)
+
+    return max(minimum, numeric_value)
+
+
 def to_nearest_multiple_of_16(value):
     """주어진 값을 가장 가까운 16의 배수로 보정, 최소 16 보장"""
     try:
@@ -112,7 +136,33 @@ def get_history(prompt_id):
     with urllib.request.urlopen(url) as response:
         return json.loads(response.read())
 
-def get_videos(ws, prompt):
+
+def maybe_upload_video(job_id, video_path):
+    required_env_vars = (
+        "BUCKET_ENDPOINT_URL",
+        "BUCKET_ACCESS_KEY_ID",
+        "BUCKET_SECRET_ACCESS_KEY",
+    )
+    if not all(os.environ.get(var_name) for var_name in required_env_vars):
+        return None
+
+    upload_file = getattr(rp_upload, "upload_file_to_bucket", None)
+    if upload_file is None:
+        logger.warning("rp_upload.upload_file_to_bucket is unavailable. Falling back to base64 output.")
+        return None
+
+    try:
+        return upload_file(
+            file_name=os.path.basename(video_path),
+            file_location=video_path,
+            prefix=job_id,
+        )
+    except Exception as exc:
+        logger.warning(f"비디오 업로드 실패, base64 결과로 fallback 합니다: {exc}")
+        return None
+
+
+def get_videos(ws, prompt, job_id):
     prompt_id = queue_prompt(prompt)['prompt_id']
     output_videos = {}
     while True:
@@ -132,23 +182,31 @@ def get_videos(ws, prompt):
         videos_output = []
         if 'gifs' in node_output:
             for video in node_output['gifs']:
-                # fullpath를 이용하여 직접 파일을 읽고 base64로 인코딩
+                video_url = maybe_upload_video(job_id, video['fullpath'])
+                if video_url:
+                    videos_output.append({"video_url": video_url})
+                    continue
+
                 with open(video['fullpath'], 'rb') as f:
                     video_data = base64.b64encode(f.read()).decode('utf-8')
-                videos_output.append(video_data)
+                videos_output.append({"video": video_data})
         output_videos[node_id] = videos_output
 
     return output_videos
 
-def load_workflow(workflow_path):
+@lru_cache(maxsize=2)
+def load_workflow_template(workflow_path):
     with open(workflow_path, 'r') as file:
         return json.load(file)
+
+def load_workflow(workflow_path):
+    return copy.deepcopy(load_workflow_template(workflow_path))
 
 def handler(job):
     job_input = job.get("input", {})
 
     logger.info(f"Received job input: {job_input}")
-    task_id = f"task_{uuid.uuid4()}"
+    task_id = job.get("id", f"task_{uuid.uuid4()}")
 
     # 이미지 입력 처리 (image_path, image_url, image_base64 중 하나만 사용)
     image_path = None
@@ -176,10 +234,10 @@ def handler(job):
     lora_pairs = job_input.get("lora_pairs", [])
     
     # 최대 4개 LoRA까지 지원
-    lora_count = min(len(lora_pairs), 4)
-    if lora_count > len(lora_pairs):
+    lora_count = min(len(lora_pairs), MAX_LORA_PAIRS)
+    if len(lora_pairs) > MAX_LORA_PAIRS:
         logger.warning(f"LoRA 개수가 {len(lora_pairs)}개입니다. 최대 4개까지만 지원됩니다. 처음 4개만 사용합니다.")
-        lora_pairs = lora_pairs[:4]
+        lora_pairs = lora_pairs[:MAX_LORA_PAIRS]
     
     # 워크플로우 파일 선택 (end_image_*가 있으면 FLF2V 워크플로 사용)
     workflow_file = "/new_Wan22_flf2v_api.json" if end_image_path_local else "/new_Wan22_api.json"
@@ -187,16 +245,21 @@ def handler(job):
     
     prompt = load_workflow(workflow_file)
     
-    length = job_input.get("length", 81)
-    steps = job_input.get("steps", 10)
+    length = clamp_int(job_input.get("length", DEFAULT_LENGTH), 1)
+    steps = clamp_int(job_input.get("steps", DEFAULT_STEPS), 1)
+    cfg = float(job_input.get("cfg", DEFAULT_CFG))
+    context_overlap = clamp_int(
+        job_input.get("context_overlap", DEFAULT_CONTEXT_OVERLAP),
+        0,
+        max(length - 1, 0),
+    )
 
     prompt["244"]["inputs"]["image"] = image_path
     prompt["541"]["inputs"]["num_frames"] = length
     prompt["135"]["inputs"]["positive_prompt"] = job_input["prompt"]
-    prompt["135"]["inputs"]["negative_prompt"] = job_input.get("negative_prompt", "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards")
+    prompt["135"]["inputs"]["negative_prompt"] = job_input.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
     prompt["220"]["inputs"]["seed"] = job_input["seed"]
-    prompt["540"]["inputs"]["seed"] = job_input["seed"]
-    prompt["540"]["inputs"]["cfg"] = job_input["cfg"]
+    prompt["220"]["inputs"]["cfg"] = cfg
     # 해상도(폭/높이) 16배수 보정
     original_width = job_input["width"]
     original_height = job_input["height"]
@@ -208,48 +271,41 @@ def handler(job):
         logger.info(f"Height adjusted to nearest multiple of 16: {original_height} -> {adjusted_height}")
     prompt["235"]["inputs"]["value"] = adjusted_width
     prompt["236"]["inputs"]["value"] = adjusted_height
-    prompt["498"]["inputs"]["context_overlap"] = job_input.get("context_overlap", 48)
+    prompt["498"]["inputs"]["context_overlap"] = context_overlap
     prompt["498"]["inputs"]["context_frames"] = length
+    prompt["569"]["inputs"]["value"] = steps
 
     # step 설정 적용
-    if "834" in prompt:
-        prompt["834"]["inputs"]["steps"] = steps
-        logger.info(f"Steps set to: {steps}")
-        lowsteps = int(steps*0.6)
-        prompt["829"]["inputs"]["step"] = lowsteps
-        logger.info(f"LowSteps set to: {lowsteps}")
+    logger.info(f"Steps set to: {steps}")
 
     # 엔드 이미지가 있는 경우 617번 노드에 경로 적용 (FLF2V 전용)
     if end_image_path_local:
         prompt["617"]["inputs"]["image"] = end_image_path_local
     
-    # LoRA 설정 적용 - HIGH LoRA는 노드 279, LOW LoRA는 노드 553
+    # LoRA 설정 적용 - single-stage 워크플로우는 단일 LoRA 브랜치만 사용
     if lora_count > 0:
-        # HIGH LoRA 노드 (279번)
         high_lora_node_id = "279"
-        
-        # LOW LoRA 노드 (553번)
-        low_lora_node_id = "553"
-        
-        # 입력받은 LoRA pairs 적용 (lora_1부터 시작)
+
         for i, lora_pair in enumerate(lora_pairs):
-            if i < 4:  # 최대 4개까지만
+            if i < MAX_LORA_PAIRS:
                 lora_high = lora_pair.get("high")
                 lora_low = lora_pair.get("low")
-                lora_high_weight = lora_pair.get("high_weight", 1.0)
-                lora_low_weight = lora_pair.get("low_weight", 1.0)
-                
-                # HIGH LoRA 설정 (노드 279번, lora_1부터 시작)
-                if lora_high:
-                    prompt[high_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_high
-                    prompt[high_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_high_weight
-                    logger.info(f"LoRA {i+1} HIGH applied to node 279: {lora_high} with weight {lora_high_weight}")
-                
-                # LOW LoRA 설정 (노드 553번, lora_1부터 시작)
-                if lora_low:
-                    prompt[low_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_low
-                    prompt[low_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_low_weight
-                    logger.info(f"LoRA {i+1} LOW applied to node 553: {lora_low} with weight {lora_low_weight}")
+                lora_name = lora_high or lora_low
+
+                if not lora_name:
+                    continue
+
+                if lora_high and lora_low and lora_high != lora_low:
+                    logger.info(f"LoRA {i+1}: single-stage workflow uses one branch, applying HIGH variant and ignoring LOW variant.")
+
+                lora_weight = (
+                    lora_pair.get("high_weight", 1.0)
+                    if lora_high
+                    else lora_pair.get("low_weight", 1.0)
+                )
+                prompt[high_lora_node_id]["inputs"][f"lora_{i+1}"] = lora_name
+                prompt[high_lora_node_id]["inputs"][f"strength_{i+1}"] = lora_weight
+                logger.info(f"LoRA {i+1} applied to node 279: {lora_name} with weight {lora_weight}")
 
     ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
     logger.info(f"Connecting to WebSocket: {ws_url}")
@@ -286,13 +342,13 @@ def handler(job):
             if attempt == max_attempts - 1:
                 raise Exception("웹소켓 연결 시간 초과 (3분)")
             time.sleep(5)
-    videos = get_videos(ws, prompt)
+    videos = get_videos(ws, prompt, task_id)
     ws.close()
 
     # 이미지가 없는 경우 처리
     for node_id in videos:
         if videos[node_id]:
-            return {"video": videos[node_id][0]}
+            return videos[node_id][0]
     
     return {"error": "비디오를를 찾을 수 없습니다."}
 
