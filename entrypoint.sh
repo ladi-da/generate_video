@@ -1,18 +1,27 @@
 #!/bin/bash
 
-# Exit immediately if a command exits with a non-zero status.
-set -e
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONUNBUFFERED=1
 
 # Start ComfyUI in the background
 echo "Starting ComfyUI in the background..."
 python /ComfyUI/main.py --listen --use-sage-attention &
+COMFY_PID=$!
 
 # Wait for ComfyUI to be ready
 echo "Waiting for ComfyUI to be ready..."
 max_wait=120  # 최대 2분 대기
 wait_count=0
 while [ $wait_count -lt $max_wait ]; do
-    if curl -s http://127.0.0.1:8188/ > /dev/null 2>&1; then
+    if ! kill -0 "$COMFY_PID" > /dev/null 2>&1; then
+        echo "Error: ComfyUI exited before becoming ready"
+        wait "$COMFY_PID" || true
+        exit 1
+    fi
+
+    if curl -fsS http://127.0.0.1:8188/ > /dev/null 2>&1; then
         echo "ComfyUI is ready!"
         break
     fi
@@ -29,4 +38,4 @@ fi
 # Start the handler in the foreground
 # 이 스크립트가 컨테이너의 메인 프로세스가 됩니다.
 echo "Starting the handler..."
-exec python handler.py
+exec python "$SCRIPT_DIR/handler.py"
